@@ -29,7 +29,8 @@ Base files: `MI_PUMA_Sample.csv` (address frame), `Vendor1_Demos.csv`,
 
 | Stage | Folder | What it does |
 |---|---|---|
-| 0 | `00_reference/` | SAIPE/PUMS poverty benchmark; county–PUMA relationship classification |
+| 0 | `data/` | Contains references to the datasets used in this analysis. They will not be included in the repository for privacy reasons |
+| 0 | `00_reference/` | Codebooks, SAIPE/PUMS poverty benchmark; county–PUMA relationship classification |
 | 1 | `01_data_preparation/` | ACS 5-yr + Decennial 2020 variable download (BG/tract/block) |
 | 2 | `02_vendor_processing/` | Clean, recode, widen Vendor 1 (≤16 persons) & Vendor 2 (≤9 persons) |
 | 3 | `03_address_frame_merge/` | Merge vendor data onto MSG address frame by MSGID |
