@@ -1,0 +1,246 @@
+---
+title: "SMART Frame Coverage Dataset Construction"
+author: "Joy Z Wu and Felix Baez-Santiago"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(janitor)
+library(tidyr)
+library(tidyverse)
+library(stringr)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+
+msg_census_data0 = read.csv("O:/slteam/SMART/NCSES MSG/msg_addresses_wide.csv")
+
+msg_census_data = msg_census_data0 %>%
+  filter(
+    pumaid %in% c("2600100", "2600802", "2601200", "2601600", "2601701", "2601703", "2602903", "2603203", "2603212")
+  ) %>% 
+  mutate(
+    pumaid = as.character(pumaid),
+    fips_bg = paste0(
+      str_pad(fips_str, width = 5, pad = "0"),
+      str_pad(tract_str, width = 6, pad = "0"),
+      as.character(blockgroup)
+    ),
+    fips = as.character(fips),
+    fips_tract = as.character(fips_tract)
+  ) 
+```
+
+## Step 1: MSG address-level counts, rolled up to block group
+
+```{r msg-bg-counts}
+msg_bg_counts <- msg_census_data %>%
+  group_by(fips_bg) %>%
+  summarise(
+    pumaid              = first(pumaid),
+    fips                = first(fips),
+    fips_tract          = first(fips_tract),
+    msg_total_units     = n_distinct(msgid),
+    msg_vacant_units    = n_distinct(msgid[vacantcode == "Y"]),
+    msg_occupied_units  = n_distinct(msgid[vacantcode == "N"]), 
+    .groups = "drop"
+  )
+msg_bg_counts
+```
+
+## Step 2: MSG missingness indicators, rolled up to block group
+
+```{r msg-missingness-bg}
+msg_missing_bg <- msg_census_data %>%
+  group_by(fips_bg) %>%
+  summarise(
+    n_addresses                 = n(),
+    pct_missing_vendor1         = mean(has_vendor_data_v1 == 0 | is.na(has_vendor_data_v1)),
+    pct_missing_vendor2         = mean(has_vendor_data_v2 == 0 | is.na(has_vendor_data_v2)),
+    pct_missing_any_vendor      = mean((has_vendor_data_v1 == 0 | is.na(has_vendor_data_v1)) &
+                                        (has_vendor_data_v2 == 0 | is.na(has_vendor_data_v2))),
+    pct_missing_income_v1       = mean(is.na(esthhincome_rec_v1) | esthhincome_rec_v1 == ""),
+    pct_missing_income_v2       = mean(is.na(esthhincome_rec_v2) | esthhincome_rec_v2 == ""),
+    pct_missing_lengthofres_v1  = mean(is.na(lengthofresidence_rec_v1) | lengthofresidence_rec_v1 == ""),
+    pct_missing_lengthofres_v2  = mean(is.na(lengthofresidence_rec_v2) | lengthofresidence_rec_v2 == ""),
+    pct_missing_ownrent_v1      = mean(is.na(ownrent_v1) | ownrent_v1 == ""),
+    pct_missing_ownrent_v2      = mean(is.na(ownrent_rec_v2) | ownrent_rec_v2 == ""),
+    .groups = "drop"
+  )
+msg_missing_bg
+```
+
+## Step 3: ACS SF / Decennial / tract-level variables, deduped to one row per block group
+
+```{r acs-bg-distinct}
+acs_bg_raw <- msg_census_data %>%
+  distinct(fips_bg, .keep_all = TRUE) %>%
+  select(
+    fips_bg, pumaid, fips, fips_tract,
+    # housing unit counts (DV inputs)
+    hu_total_bgE, occ_total_bgE, occ_occupied_bgE, occ_vacant_bgE,
+    # tenure
+    tenure_total_bgE, tenure_owned_bgE, tenure_rented_bgE,
+    # household type / married couple
+    hht_total_bgE, hht_married_couple_bgE, hht_family_bgE, hht_nonfamily_bgE,
+    # population & age (person-level, for 65+ / under-18)
+    pop_total_bgE,
+    male_u5_bgE, male_5_9_bgE, male_10_14_bgE, male_15_17_bgE,
+    female_u5_bgE, female_5_9_bgE, female_10_14_bgE, female_15_17_bgE,
+    male_65_66_bgE, male_67_69_bgE, male_70_74_bgE, male_75_79_bgE, male_80_84_bgE, male_85plus_bgE,
+    female_65_66_bgE, female_67_69_bgE, female_70_74_bgE, female_75_79_bgE, female_80_84_bgE, female_85plus_bgE,
+    # race / ethnicity
+    race_total_bgE, race_nh_white_bgE, race_hispanic_bgE,
+    # income & poverty
+    median_hhincome_bgE, pov_total_bgE, pov_below_bgE,
+    # LEP (person-level, ages 5+, no household-level LEP available in this file)
+    lep_total_bgE,
+    lep_span_notwell_bgE, lep_span_notatall_bgE,
+    lep_indoeuro_notwell_bgE, lep_indoeuro_notatall_bgE,
+    lep_asian_notwell_bgE, lep_asian_notatall_bgE,
+    lep_other_notwell_bgE, lep_other_notatall_bgE,
+    # tract-level (SNAP / public assistance) - duplicated across BGs in same tract
+    snap_total_trE, snap_received_trE,
+    pubassist_total_trE, pubassist_received_trE
+  )
+acs_bg_raw
+```
+
+## Step 4: Assemble block-group-level dataset (DVs + IVs)
+
+```{r bg-level-assemble}
+bg_level_dataset <- acs_bg_raw %>%
+  left_join(msg_bg_counts  %>% select(-pumaid, -fips, -fips_tract), by = "fips_bg") %>%
+  left_join(msg_missing_bg, by = "fips_bg") %>%
+  mutate(
+    #  DVs: frame coverage discrepancy 
+    acs_hu_total          = hu_total_bgE,
+    acs_occ_total         = occ_occupied_bgE,
+    msg_acs_diff_abs       = msg_total_units - acs_hu_total,
+    msg_acs_diff_rel       = msg_total_units / acs_hu_total,
+    msg_acs_occ_diff_abs   = msg_occupied_units - acs_occ_total,    # unreliable
+    msg_acs_occ_diff_rel   = msg_occupied_units / acs_occ_total,    # unreliable
+
+    #  IVs: household-level
+    pct_married_couple_hh = hht_married_couple_bgE / hht_total_bgE,
+    pct_rented            = tenure_rented_bgE / tenure_total_bgE,
+    pct_below_poverty      = pov_below_bgE / pov_total_bgE,         # household- vs. family-based framing with Sunghee
+    median_hh_income      = median_hhincome_bgE,
+    pct_snap               = snap_received_trE / snap_total_trE,    
+    pct_public_assistance  = pubassist_received_trE / pubassist_total_trE,  # tract-level
+
+    #  IVs: person-level 
+    pct_65plus_person = (male_65_66_bgE + male_67_69_bgE + male_70_74_bgE + male_75_79_bgE + male_80_84_bgE + male_85plus_bgE +
+                          female_65_66_bgE + female_67_69_bgE + female_70_74_bgE + female_75_79_bgE + female_80_84_bgE + female_85plus_bgE) /
+                          pop_total_bgE,
+    pct_under18        = (male_u5_bgE + male_5_9_bgE + male_10_14_bgE + male_15_17_bgE +
+                           female_u5_bgE + female_5_9_bgE + female_10_14_bgE + female_15_17_bgE) /
+                           pop_total_bgE,
+    pct_minority       = (race_total_bgE - race_nh_white_bgE) / race_total_bgE,
+    pct_hispanic       = race_hispanic_bgE / race_total_bgE,
+    pct_lep_person     = (lep_span_notwell_bgE + lep_span_notatall_bgE +
+                           lep_indoeuro_notwell_bgE + lep_indoeuro_notatall_bgE +
+                           lep_asian_notwell_bgE + lep_asian_notatall_bgE +
+                           lep_other_notwell_bgE + lep_other_notatall_bgE) /
+                           lep_total_bgE
+  )
+
+View(bg_level_dataset)
+bg_level_dataset
+```
+
+## Step 5: Aggregate to PUMA level (sum raw counts first, then compute rates)
+
+```{r puma-level-assemble}
+puma_level_dataset <- bg_level_dataset %>%
+  group_by(pumaid) %>%
+  summarise(
+    n_block_groups          = n(),
+
+    # MSG counts
+    msg_total_units         = sum(msg_total_units, na.rm = TRUE),
+    msg_occupied_units      = sum(msg_occupied_units, na.rm = TRUE),  # flagged unreliable
+
+    # ACS raw counts (sum numerators/denominators BEFORE computing rates)
+    acs_hu_total            = sum(hu_total_bgE, na.rm = TRUE),
+    acs_occ_total           = sum(occ_occupied_bgE, na.rm = TRUE),
+    hht_total_sum           = sum(hht_total_bgE, na.rm = TRUE),
+    hht_married_sum         = sum(hht_married_couple_bgE, na.rm = TRUE),
+    tenure_total_sum        = sum(tenure_total_bgE, na.rm = TRUE),
+    tenure_rented_sum       = sum(tenure_rented_bgE, na.rm = TRUE),
+    pov_total_sum           = sum(pov_total_bgE, na.rm = TRUE),
+    pov_below_sum           = sum(pov_below_bgE, na.rm = TRUE),
+    pop_total_sum           = sum(pop_total_bgE, na.rm = TRUE),
+    pop_65plus_sum          = sum(male_65_66_bgE + male_67_69_bgE + male_70_74_bgE + male_75_79_bgE + male_80_84_bgE + male_85plus_bgE +
+                                   female_65_66_bgE + female_67_69_bgE + female_70_74_bgE + female_75_79_bgE + female_80_84_bgE + female_85plus_bgE,
+                                   na.rm = TRUE),
+    pop_under18_sum         = sum(male_u5_bgE + male_5_9_bgE + male_10_14_bgE + male_15_17_bgE +
+                                   female_u5_bgE + female_5_9_bgE + female_10_14_bgE + female_15_17_bgE,
+                                   na.rm = TRUE),
+    race_total_sum          = sum(race_total_bgE, na.rm = TRUE),
+    race_nh_white_sum       = sum(race_nh_white_bgE, na.rm = TRUE),
+    race_hispanic_sum       = sum(race_hispanic_bgE, na.rm = TRUE),
+    lep_total_sum           = sum(lep_total_bgE, na.rm = TRUE),
+    lep_notwell_sum         = sum(lep_span_notwell_bgE + lep_span_notatall_bgE +
+                                   lep_indoeuro_notwell_bgE + lep_indoeuro_notatall_bgE +
+                                   lep_asian_notwell_bgE + lep_asian_notatall_bgE +
+                                   lep_other_notwell_bgE + lep_other_notatall_bgE,
+                                   na.rm = TRUE),
+    snap_total_sum          = sum(snap_total_trE, na.rm = TRUE),
+    snap_received_sum       = sum(snap_received_trE, na.rm = TRUE),
+    pubassist_total_sum     = sum(pubassist_total_trE, na.rm = TRUE),
+    pubassist_received_sum  = sum(pubassist_received_trE, na.rm = TRUE),
+
+    # income - weight by household count rather than sum 
+    median_hh_income        = weighted.mean(median_hhincome_bgE, hht_total_bgE, na.rm = TRUE),
+
+    # MSG missingness 
+    pct_missing_any_vendor  = weighted.mean(pct_missing_any_vendor, n_addresses, na.rm = TRUE),
+    pct_missing_income_v1   = weighted.mean(pct_missing_income_v1, n_addresses, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    msg_acs_diff_abs      = msg_total_units - acs_hu_total,
+    msg_acs_diff_rel      = msg_total_units / acs_hu_total,
+    msg_acs_occ_diff_abs  = msg_occupied_units - acs_occ_total,   
+    msg_acs_occ_diff_rel  = msg_occupied_units / acs_occ_total,  
+
+    pct_married_couple_hh = hht_married_sum / hht_total_sum,
+    pct_rented            = tenure_rented_sum / tenure_total_sum,
+    pct_below_poverty     = pov_below_sum / pov_total_sum,
+    pct_65plus_person     = pop_65plus_sum / pop_total_sum,
+    pct_under18           = pop_under18_sum / pop_total_sum,
+    pct_minority          = (race_total_sum - race_nh_white_sum) / race_total_sum,
+    pct_hispanic          = race_hispanic_sum / race_total_sum,
+    pct_lep_person        = lep_notwell_sum / lep_total_sum,
+    pct_snap              = snap_received_sum / snap_total_sum,
+    pct_public_assistance = pubassist_received_sum / pubassist_total_sum
+  )
+
+puma_level_dataset %>%
+  select(
+    pumaid, n_block_groups, msg_total_units, acs_hu_total,
+    msg_acs_diff_abs, msg_acs_diff_rel,
+    pct_married_couple_hh, pct_65plus_person, pct_under18,
+    pct_minority, pct_hispanic, pct_below_poverty, pct_lep_person,
+    median_hh_income
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(., 3))) %>%
+  kable(caption = "PUMA-Level Frame Coverage Dataset") %>%
+  kable_styling(
+    font_size = 12,
+    latex_options = c("scale_down", "hold_position")
+  )
+```
+
+## Step 6: Export
+
+```{r export}
+write_csv(bg_level_dataset,   "bg_level_frame_coverage_dataset.csv")
+write_csv(puma_level_dataset, "puma_level_frame_coverage_dataset.csv")

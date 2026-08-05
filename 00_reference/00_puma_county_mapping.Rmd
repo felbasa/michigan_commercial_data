@@ -1,0 +1,491 @@
+---
+title: "00_get_data"
+output: pdf_document
+date: "2026-05-11"
+---
+
+# Set up
+```{r setup, include=FALSE}
+rm(list = ls())
+
+library(censusapi)
+library(tidycensus)
+library(tidyverse)
+library(readxl)
+library(httr)
+library(jsonlite)
+library(ggplot2)
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+# When running for the first time, get and set personal API key
+census_api_key(Sys.getenv("CENSUS_API_KEY"))
+census_key <- Sys.getenv("CENSUS_API_KEY")
+```
+
+# SAIPE
+
+## Get data dictionary
+```{r}
+url <- paste0("https://api.census.gov/data/timeseries/poverty/saipe/variables.json?key=", census_key)
+
+saipe_vars <- fromJSON(url)$variables %>%
+  as.data.frame() %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("variable")
+```
+
+## Pull in SAIPE data
+```{r}
+target_vars <- c("STABREV",          # state abbreviation
+                 "NAME",             # county name
+                 "COUNTY",           # County FIPS Code
+                 "SAEPOVALL_LB90",   # All ages in Poverty, Count Lower Bound for 90% Confidence Interval
+                 "SAEPOVALL_MOE",    # All ages in Poverty, Count Margin of Error
+                 "SAEPOVALL_PT",     # All ages in Poverty, Count Estimate
+                 "SAEPOVALL_UB90",   # All ages in Poverty, Count Upper Bound for 90% Confidence Interval
+                 "SAEPOVRTALL_LB90", # All ages in Poverty, Rate Lower Bound for 90% Confidence Interval
+                 "SAEPOVRTALL_MOE",  # All ages in Poverty, Rate Margin of Error
+                 "SAEPOVRTALL_PT",   # All ages in Poverty, Rate Estimate
+                 "SAEPOVRTALL_UB90", # All ages in Poverty, Rate Upper Bound for 90% Confidence Interval
+                 "SAEPOVU_ALL")      # All Ages in Poverty Universe
+
+mi_saipe <- getCensus(
+  name     = "timeseries/poverty/saipe",
+  key      = census_key,
+  vars     = target_vars,
+  YEAR     = 2024,
+  region   = "county:*",
+  regionin = "state:26"
+)
+```
+
+## Understanding the relationship between PUMAs and Counties
+
+### Use PUMA as grouping unit
+
+\begin{table}[h]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{|l|p{6cm}|p{5cm}|}
+\hline
+\textbf{Relationship} & \textbf{Description} & \textbf{Aggregation Rule} \\
+\hline
+1:1 & One county $\leftrightarrow$ one PUMA & Aggregate to PUMA level \\
+\hline
+1:n & One county spans multiple PUMAs, each PUMA only contains the one county & Use county as unit \\
+\hline
+n:1 & Multiple counties within one PUMA, these counties don't belong to other PUMAs & Aggregate to PUMA \\
+\hline
+n:m & Multiple counties $\leftrightarrow$ multiple PUMAs & Use county as unit (no PUMA aggregation) \\
+\hline
+\end{tabular}%n
+}
+\caption{County-PUMA Relationship Types and Aggregation Rules}
+\label{tab:county_puma}
+\end{table}
+
+```{r}
+# From ICR-NCSES Project > PUMA Selection > mi_puma_county_indicator.xlsx
+mapping <- as.data.frame(read_xlsx("mi_puma_county_indicator.xlsx"))
+
+# Count how many PUMAs each county belongs to
+county_puma_counts <- mapping %>%
+  group_by(county_fips) %>%
+  summarise(n_pumas = n_distinct(puma_code))
+
+# Count how many counties each PUMA contains
+puma_county_counts <- mapping %>%
+  group_by(puma_code) %>%
+  summarise(n_counties = n_distinct(county_fips))
+
+puma_relationship <- mapping %>%
+  left_join(county_puma_counts, by = "county_fips") %>%
+  left_join(puma_county_counts, by = "puma_code") %>%
+  group_by(puma_code) %>%
+  summarise(
+    n_counties = first(n_counties),
+    max_n_pumas = max(n_pumas)  # == 1 -> all counties in PUMA are exclusive to it, > 1 -> at least one county bleeds into another
+  ) %>%
+  mutate(
+    relationship = case_when(
+      n_counties == 1 & max_n_pumas == 1 ~ "1:1",
+      n_counties == 1 & max_n_pumas  > 1 ~ "1:n",
+      n_counties  > 1 & max_n_pumas == 1 ~ "n:1",
+      n_counties  > 1 & max_n_pumas  > 1 ~ "n:m",
+    ),
+    aggregation_unit = if_else(max_n_pumas == 1, "puma", "county")
+  )
+
+puma_relationship %>% 
+  group_by(relationship) %>% 
+  tally()
+
+nrow(puma_relationship) == n_distinct(mapping$puma_code)
+```
+
+```{r}
+# so this says that puma 2601701 contains 2 counties, and that one of them belongs to 4 different pumas
+puma_relationship %>% 
+  filter(relationship=="n:m")
+mapping %>% 
+  filter(puma_code=="2601701")
+mapping %>% 
+  filter(county_fips=="26049")
+mapping %>% 
+  filter(county_fips=="26087")
+```
+
+### Use county as grouping unit
+
+No county can be classified as more than one type!
+
+- 1:1 (8 counties) - the county maps to exactly one PUMA, and that PUMA contains only that one county -> doesn't matter how we aggregate; county and PUMA level counts are the same
+- 1:n (8 counties) - the county spans multiple PUMAs, but each of those PUMAs contains only that one county -> no PUMA level counts, only county
+- n:1 (66 counties) - the county belongs to only one PUMA, but that PUMA contains multiple counties -> we can have both county and PUMA (by summing across counties) level counts
+- n:m (1 county) - the county spans multiple PUMAs, and at least one of those PUMAs also contains other counties -> need to decide on aggregation rule
+
+```{r}
+county_relationship <- mapping %>%
+  left_join(county_puma_counts, by = "county_fips") %>%
+  left_join(puma_county_counts, by = "puma_code") %>%
+  group_by(county_fips) %>%
+  summarise(
+    n_pumas = first(n_pumas),
+    max_n_counties = max(n_counties)
+  ) %>%
+  mutate(
+    relationship = case_when(
+      n_pumas == 1 & max_n_counties == 1 ~ "1:1",
+      n_pumas  > 1 & max_n_counties == 1 ~ "1:n",
+      n_pumas == 1 & max_n_counties  > 1 ~ "n:1",
+      n_pumas  > 1 & max_n_counties  > 1 ~ "n:m",
+    ),
+    aggregation_unit = if_else(n_pumas == 1, "puma", "county")
+  )
+
+county_relationship %>% 
+  group_by(relationship) %>% 
+  tally()
+
+nrow(county_relationship) == n_distinct(mapping$county_fips)
+```
+
+### m:n
+```{r}
+county_relationship %>% 
+  filter(relationship=="n:m")
+mapping %>% 
+  filter(county_fips=="26049")
+```
+```{r}
+mapping %>%
+  filter(puma_code %in% (mapping %>% filter(county_fips == "26049") %>% select(puma_code) %>% pull()))
+```
+
+```{r}
+mapping %>% 
+  filter(puma_code %in% c("2601701", "2601702", "2601703", "2601704"))
+```
+
+```{r}
+c.fips <- mapping %>% 
+  filter(puma_code %in% c("2601701", "2601702", "2601703", "2601704")) %>% 
+  distinct(county_fips)
+county_relationship %>% 
+  filter(county_fips %in% c.fips$county_fips)
+```
+
+### n:1
+```{r}
+county_relationship %>% 
+  filter(relationship=="n:1")
+mapping %>% 
+  filter(county_fips=="26023")
+mapping %>% 
+  filter(county_fips=="26149")
+# We expect the next two filters to return the same thing
+mapping %>% 
+  filter(puma_code %in% c("2602200"))
+mapping %>% 
+  filter(county_fips %in% c("26023", "26149"))
+```
+
+### 1:n
+```{r}
+county_relationship %>% 
+  filter(relationship=="1:n")
+# We expect the next two filters to return the same thing
+mapping %>% 
+  filter(county_fips=="26065") # we only expect to see pumas 2601801 and 2601802
+mapping %>% 
+  filter(puma_code %in% c("2601801", "2601802")) # we only expect to see county 26065
+```
+
+### 1:1
+```{r}
+county_relationship %>% 
+  filter(relationship=="1:1")
+mapping %>% 
+  filter(county_fips%in%c("26005", "26021")) # Should only return PUMAs 2600900 and 2602400
+mapping %>% 
+  filter(puma_code %in% c("2600900", "2602400")) # Should only return counties 26005 and 26021
+```
+
+
+## Merge to mapping file
+```{r}
+mi_saipe <- mi_saipe %>% 
+  mutate(county_fips = paste0(state, county)) 
+
+poverty.saipe <- mapping %>% 
+  select(puma_code, puma_name, county_fips, county_name) %>% 
+  merge(mi_saipe,
+        by = c("county_fips"),
+        all.x = TRUE) %>% 
+  merge(county_relationship,
+        by = c("county_fips"),
+        all.x = TRUE) 
+
+write.csv(poverty.saipe, "saipe_pov_all.csv")
+```
+
+## Get PUMA level counts
+```{r}
+mi.saipe.puma <- poverty.saipe %>%
+  filter(relationship %in% c("1:1", "n:1")) %>% 
+  group_by(puma_code) %>% 
+  summarise(pov.count.saipe = sum(SAEPOVALL_PT))
+```
+
+## Definition of poverty
+
+The SAIPE program produces estimates of the [total number](https://www.census.gov/programs-surveys/saipe/about.html) of people in poverty at the county and state level.
+
+According to SAIPE's [documentation](https://www.census.gov/programs-surveys/saipe/about/faq.html#faq7): "Poverty is defined at the family level, either everyone in the family is in poverty or no one in the family is in poverty. The characteristics of the family used to determine the poverty threshold are: number of people, number of related children under 18, and whether or not the primary householder is over age 65. Family income is then compared to the poverty threshold; if that family's income is below that threshold, the family is in poverty." 
+
+For a given family, the Census Bureau computes poverty status by totaling the income of all related family members living together. If total family income:
+
+- is less than the poverty threshold for that family, that family and everyone in it is considered to be in poverty
+- equals or is greater than the poverty threshold, the family is not considered to be in poverty
+
+Additional details can be found [here](https://www.census.gov/topics/income-poverty/poverty/guidance/poverty-measures.html). This page also defines the Ratio of Income to Poverty, which is family income divided by the poverty threshold for that family. The difference in dollars between family income and the poverty threshold is called the Income Deficit (for families in poverty) or Income Surplus (for families above poverty). This will be important for getting estimates of poverty from ACS later on.
+
+The poverty threshold is updated every year, and can be found [here](https://www.census.gov/data/tables/time-series/demo/income-poverty/historical-poverty-thresholds.html).
+
+
+Lastly, we note that poverty status cannot be determined for people in: 
+
+- Institutional group quarters (such as prisons or nursing homes)
+- College dormitories
+- Military barracks
+- Living situations without conventional housing (and who are not in shelters)
+- Unrelated individuals under age 15 (such as foster children
+
+# ACS
+
+Helpful links:
+
+- data dictionary: https://www2.census.gov/programs-surveys/acs/tech_docs/pums/data_dict/PUMS_Data_Dictionary_2024.pdf
+- helpful overview: https://walker-data.com/census-r/introduction-to-census-microdata.html?q=pums#variables-available-in-the-acs-pums
+
+## 1 year
+
+### Get data
+```{r, message = FALSE, warning = FALSE, results = 'hide'}
+mi_pums <- get_pums(
+  variables = c("SEX", 
+                "AGEP", 
+                "HHT","HHT2", 
+                "POVPIP", 
+                "PUMA",
+                "STATE",
+                "TYPEHUGQ"),
+  state = "MI",
+  survey = "acs1",
+  year = 2024
+)
+```
+
+```{r}
+head(mi_pums)
+paste("Sample size: ", nrow(mi_pums))
+```
+
+### Preprocess
+
+Filter out instances where POVPIP is N/A (-1 in our data)
+"individuals who are under 15 and are either living in a housing unit but are unrelated to the householder or are living in select group quarters"
+```{r}
+mi_analysis <- mi_pums %>% 
+  mutate(POVPIP = as.numeric(POVPIP)) %>%   # <-- the fix: numeric, so < and >= compare correctly
+  filter(POVPIP >= 0, TYPEHUGQ == 1)
+paste("Remaining sample size: ", nrow(mi_analysis))
+```
+
+### Get estimate of number of people in poverty by PUMA
+
+We'll follow the logic documented [here](https://www.census.gov/topics/income-poverty/poverty/guidance/poverty-measures.html), which specifies "if a family's total income was greater than their poverty threshold, they are not considered 'in poverty' according to the official definition."
+
+We'll calculate this value two ways, by dividing the total number of people in poverty (POVPIP<100):
+
+- by the total number of people
+- by the total number of people with a valid POVPIP (i.e !=-1)
+
+```{r}
+# Get the estimate of total number of people 
+pop.est <- sum(mi_pums$PWGTP); paste("Estimate of MI pop: ", pop.est)
+```
+
+As a sanity check, this population estimate equals the value posted by the [Census Bureau](https://www.census.gov/quickfacts/fact/table/MI/PST045224).
+
+```{r}
+# Get the estimate of total number of people who have valid POVPIP value
+pop.est.v <- sum(mi_analysis$PWGTP); paste("Estimate of MI pop (with valid POVPIP): ", pop.est.v)
+# Get the number of people by PUMA
+mi.size.all <- mi_pums %>% 
+  group_by(PUMA) %>% 
+  summarise(n.all = sum(PWGTP))
+# Get the number of people w valid POVPIP only
+mi.size.valid <- mi_analysis %>% 
+  group_by(PUMA) %>% 
+  summarise(n.valid = sum(PWGTP))
+# Get estimate of number of people in poverty by PUMA
+mi.pov.count <- mi_analysis %>% 
+  filter(POVPIP < 100) %>% 
+  group_by(PUMA) %>% 
+  summarise(n.pov.puma = sum(PWGTP))
+# Consolidate information
+mi_acs1 <- mi.size.all %>% 
+  merge(mi.pov.count,
+        by = "PUMA") %>% 
+  mutate(perc.pov.all = round(n.pov.puma/n.all*100,1)) %>% 
+  merge(mi.size.valid,
+        by = "PUMA") %>% 
+  mutate(perc.pov.valid = round(n.pov.puma/n.valid*100,1))
+mi_acs1 <- mi_acs1 %>% 
+  mutate(puma_code=paste0("26",PUMA))
+write_csv(mi_acs1, "acs1_pov_all.csv")
+head(mi_acs1)
+```
+
+# Things to note
+
+## 1. Inconsistent PUMA level-estimates of poverty counts across SAIPE and ACS
+
+- The magnitude of the poverty estimates across the two datasets are not the same
+- I'm wondering if this is because there is still some inconsistency between how poverty is defined between SAIPE and ACS?
+
+```{r}
+mi.acs1 <- mi_acs1 %>% 
+  rename(pov.count.acs = n.pov.puma) %>% 
+  select(puma_code, pov.count.acs)
+nrow(mi.acs1)==68
+
+combined <- mi.acs1 %>% 
+  merge(mi.saipe.puma,
+        by = "puma_code",
+        all.y = TRUE)
+```
+
+```{r}
+mi.saipe.puma %>% 
+  filter(puma_code=="2600700")
+mapping %>% 
+  filter(puma_code=="2600700")
+mapping %>% 
+  filter(county_fips=="26121")
+mi_saipe %>% 
+  filter(county=="700")
+mi_saipe %>% 
+  filter(NAME=="Muskegon County")
+```
+
+```{r}
+sum(mi_pums %>%
+  filter(PUMA == "00700",
+         TYPEHUGQ == "1",
+         as.numeric(POVPIP) >= 0,
+         as.numeric(POVPIP) < 100) %>%
+  pull(PWGTP))
+```
+
+```{r}
+combined %>%
+  mutate(puma_code = reorder(puma_code, pov.count.saipe)) %>%
+  pivot_longer(cols = c(pov.count.acs, pov.count.saipe), 
+               names_to = "source", values_to = "count") %>%
+  ggplot(aes(x = puma_code, y = count, color = source)) +
+  geom_point() +
+  coord_flip() +
+  labs(title = "Poverty Count by PUMA: ACS vs SAIPE",
+       x = "PUMA", y = "Poverty Count", color = "Source") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 4))
+```
+
+```{r}
+combined %>%
+  summarise(
+    across(c(pov.count.acs, pov.count.saipe),
+           list(min    = min,
+                mean   = mean,
+                median = median,
+                max    = max),
+           .names = "{.col}_{.fn}")
+  ) %>%
+  pivot_longer(everything(),
+               names_to  = c("source", "stat"),
+               names_sep = "_(?=[^_]+$)") %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(across(where(is.numeric), ~round(., 0))) %>%
+  knitr::kable(caption = "Summary Statistics: ACS vs SAIPE Poverty Counts")
+```
+
+## 2. Counties are double-counted in SAIPE estimates
+
+To get PUMA level counts, we sum `SAEPOVALL_PT` across all counties in each PUMA. Since `r nrow(multi.pumas.counties)` counties span multiple PUMAs, their counts appear in more than one PUMA.
+
+```{r}
+# multi.pumas.counties
+```
+
+
+## 3. inconsistent POVPIP within the same family in ACS
+
+This appears to be inconsistent with how SAIPE defines poverty, which indicates that all family members should have the same poverty status. Consider family `SERIALNO=='2024HU0004155'`:
+
+- Three members (SPORDER 1-3) have POVPIP < 100, indicating they are in poverty 
+- One member (SPORDER 4) has POVPIV > 100, indicating that they are not
+
+Perhaps these family members don't live at the same address?
+```{r}
+# Is povpip the same for everyone in the same family?
+# i.e. is povpip should be the same for all members of the same family (same SERIALNO)
+inconsistent <- mi_pums %>%
+  group_by(SERIALNO) %>%
+  summarise(n_unique_povpip = n_distinct(POVPIP, na.rm = FALSE)) %>%
+  filter(n_unique_povpip > 1)
+
+cat("Families with inconsistent POVPIP:", nrow(inconsistent), "\n")
+# Take a look at the first three
+mi_pums %>% 
+  filter(SERIALNO %in% inconsistent$SERIALNO[3])
+```
+
+```{r}
+combined %>% 
+  arrange(desc(pov.count.saipe))
+```
+```{r}
+mapping %>% 
+  filter(county_fips=="26163")
+```
+
+
+
+
+
+
+

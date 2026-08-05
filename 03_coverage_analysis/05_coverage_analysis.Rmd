@@ -1,0 +1,414 @@
+---
+title: "MSG Frame Coverage Analysis"
+author: "Felix Baez-Santiago"
+date: "2026-05-26"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(janitor)
+library(tidyr)
+library(tidyverse)
+library(stringr)
+library(knitr)
+library(kableExtra)
+
+msg_census_data0 = read.csv("O:/slteam/SMART/NCSES MSG/msg_addresses_wide.csv")
+
+msg_census_data = msg_census_data0 %>%
+  filter(
+    pumaid %in% c("2600100", "2600802", "2601200", "2601600", "2601701", "2601703", "2602903", "2603203", "2603212")
+  ) %>% 
+  mutate(pumaid = as.character(pumaid))
+```
+
+## Overview
+-1 how much does MSG overcount occupied households relative to 
+census benchmarks
+-2 is that discrepancy systematic with respect to 
+county-level characteristics?
+
+## 1. MSG vs. Census Household Counts by County
+
+MSG household counts are compared against ACS and Decennial occupied unit counts.  A ratio above 1.0 indicates MSG overcounts relative to the benchmark.
+
+```{r coverage-table}
+msg_hh_county <- msg_census_data %>% 
+  group_by(fips) %>%
+  summarise(
+    msg_hh_count   = n_distinct(msgid),
+    msg_vacant     = n_distinct(msgid[vacantcode == "Y"]),
+    msg_occupied   = n_distinct(msgid[vacantcode == "N"]),
+    .groups = "drop"
+  )
+
+# ACS and Decennial counts by county (total and occupied)
+acs_hh_county <- msg_census_data %>%
+  distinct(fips_bg, .keep_all = TRUE) %>%
+  group_by(fips) %>%
+  summarise(
+    acs_hu_total  = sum(hu_total_bgE,        na.rm = TRUE),
+    acs_occ_total = sum(occ_occupied_bgE,    na.rm = TRUE),
+    dec_hu_total  = sum(dec_occ_total_bg,    na.rm = TRUE),
+    dec_occ_total = sum(dec_occ_occupied_bg, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ # Join and compute ratios vs both total HU and occupied HU
+county_coverage <- msg_hh_county %>%
+  left_join(acs_hh_county, by = "fips") %>%
+  mutate(
+    # vs occupied
+    msg_vs_acs_occ_ratio = msg_hh_count / acs_occ_total,
+    msg_vs_dec_occ_ratio = msg_hh_count / dec_occ_total,
+    # vs total housing units
+    msg_vs_acs_hu_ratio  = msg_hh_count / acs_hu_total,
+    msg_vs_dec_hu_ratio  = msg_hh_count / dec_hu_total
+  )
+
+tab1 <- county_coverage %>%
+  select(fips, msg_hh_count, msg_vacant, msg_occupied,
+         acs_hu_total, acs_occ_total,
+         dec_hu_total, dec_occ_total,
+         msg_vs_acs_occ_ratio, msg_vs_acs_hu_ratio,
+         msg_vs_dec_occ_ratio, msg_vs_dec_hu_ratio) %>%
+  mutate(across(c(msg_vs_acs_occ_ratio, msg_vs_acs_hu_ratio,
+                  msg_vs_dec_occ_ratio, msg_vs_dec_hu_ratio), ~round(., 2))) %>%
+  kable(col.names = c("FIPS", 
+                      "MSG Total", "MSG Vacant", "MSG Occupied",
+                      "ACS Total", "ACS Occ",
+                      "Dec Total", "Dec Occ",
+                      "MSG/ACS Occ", "MSG/ACS Tot",
+                      "MSG/Dec Occ", "MSG/Dec Tot"),
+        caption = "MSG vs. Census HH Counts by County (Total and Occupied)",
+        format.args = list(big.mark = ",")) %>%
+  kable_styling(font_size = 8, latex_options = c("scale_down", "hold_position"))
+tab1
+```
+
+
+
+---
+
+## 2. Does Overcoverage Depend on County Characteristics?
+
+```{r chars-correlation}
+
+county_chars <- msg_census_data %>%
+  distinct(fips_bg, .keep_all = TRUE) %>%
+  group_by(fips) %>%
+  summarise(
+    pov_rate     = sum(pov_below_bgE,     na.rm = TRUE) / sum(pov_total_bgE,    na.rm = TRUE),
+    pct_hispanic = sum(race_hispanic_bgE, na.rm = TRUE) / sum(race_total_bgE,   na.rm = TRUE),
+    pct_rented   = sum(tenure_rented_bgE, na.rm = TRUE) / sum(tenure_total_bgE, na.rm = TRUE),
+    median_inc   = weighted.mean(median_hhincome_bgE, hu_total_bgE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  as.data.frame()
+
+county_coverage_chars <- county_coverage %>%
+  left_join(county_chars, by = "fips") %>%
+  as.data.frame()
+
+cor_matrix <- county_coverage_chars %>%
+  select(msg_vs_acs_occ_ratio, msg_vs_acs_hu_ratio,
+         msg_vs_dec_occ_ratio, msg_vs_dec_hu_ratio,
+         pov_rate, pct_hispanic, pct_rented, median_inc) %>%
+  cor(use = "complete.obs") %>%
+  round(3)
+
+short_names <- c("MSG/ACS Occ", "MSG/ACS Total", 
+                 "MSG/Dec Occ", "MSG/Dec Total",
+                 "Poverty Rate", "% Hispanic", 
+                 "% Rented", "Median Income")
+
+rownames(cor_matrix) <- short_names
+colnames(cor_matrix) <- short_names
+
+tab2 <- cor_matrix %>%
+  kable(caption = "Correlations between MSG Overcoverage Ratios and County Characteristics") %>%
+  kable_styling(font_size = 9, latex_options = c("scale_down", "hold_position"))
+
+tab2
+```
+
+
+# ACS PUMS Household-Level Indicators
+```{r}
+# read in person level pums file
+library(googledrive)
+library(readr)
+
+plink <- "https://drive.google.com/file/d/1V24rheRA0pjVl5JNZEVSFv8nRF6wbmp0/view?usp=drive_link"
+
+# Extract file ID from link
+file_id <- sub(".*?/d/([^/]+)/.*", "\\1", plink)
+
+# Get drive file object
+drv_file <- drive_get(as_id(file_id))
+
+# Download to a temporary local file
+tmp <- tempfile(fileext = ".csv")   # change extension if needed
+drive_download(drv_file, path = tmp, overwrite = TRUE)
+
+# Read into R
+psam_p26 <- read_csv(tmp) %>% 
+  filter(
+    PUMA %in% c( "00100", "00802", "01200", "01600", "01701", "01703", "02903", "03203", "03212")
+  ) 
+
+# read in household level pums file
+hlink ="https://drive.google.com/file/d/16Qbt4R0xLeEB_m3YlQGJ7qIq550MOO3X/view?usp=sharing"
+
+# Extract file ID from link
+file_id <- sub(".*?/d/([^/]+)/.*", "\\1", hlink)
+
+# Get drive file object
+drv_file <- drive_get(as_id(file_id))
+
+# Download to a temporary local file
+tmp2 <- tempfile(fileext = ".csv")   # change extension if needed
+drive_download(drv_file, path = tmp2, overwrite = TRUE)
+
+# Read into R
+psam_h26 <- read_csv(tmp2) %>% 
+  filter(
+    PUMA %in% c( "00100", "00802", "01200", "01600", "01701", "01703", "02903", "03203", "03212")
+  ) 
+```
+
+```{r}
+# restrict household file to actual housing units (drop group quarters)
+psam_h26_hu <- psam_h26 %>%
+  filter(TYPEHUGQ == 1)
+
+# Marital status indicator (married couple household vs. not)
+psam_h26_hu <- psam_h26_hu %>%
+  mutate(
+    married_couple_hh = case_when(
+      HHT == 1        ~ 1L,
+      HHT %in% 2:7     ~ 0L,
+      TRUE             ~ NA_integer_
+    )
+  )
+
+psam_h26_hu %>% tabyl(married_couple_hh, show_na = TRUE) %>% adorn_pct_formatting(digits = 2)
+```
+
+```{r}
+#  Count of household members aged 65+
+hh_65plus <- psam_p26 %>%
+  group_by(SERIALNO) %>%
+  summarise(n_65plus = sum(AGEP >= 65, na.rm = TRUE), .groups = "drop")
+
+psam_h26_hu <- psam_h26_hu %>%
+  left_join(hh_65plus, by = "SERIALNO") %>%
+  mutate(n_65plus = replace_na(n_65plus, 0))
+
+summary(psam_h26_hu$n_65plus)
+```
+
+
+```{r}
+# household income allocation flag
+psam_h26_hu <- psam_h26_hu %>%
+  mutate(
+    hhincome_imputed = case_when(
+      FHINCP == 1 ~ 1L,
+      FHINCP == 0 ~ 0L,
+      TRUE        ~ NA_integer_
+    )
+  )
+
+psam_h26_hu %>% tabyl(hhincome_imputed, show_na = TRUE) %>% adorn_pct_formatting(digits = 2)
+```
+
+
+```{r}
+# Limited English proficiency variable
+psam_h26_hu <- psam_h26_hu %>%
+  mutate(
+    lep_household = case_when(
+      LNGI == 2 ~ 1L,  
+      LNGI == 1 ~ 0L, 
+      TRUE      ~ NA_integer_
+    )
+  )
+
+psam_h26_hu %>% tabyl(lep_household, show_na = TRUE) %>% adorn_pct_formatting(digits = 2)
+```
+
+
+```{r}
+puma_pums_summary <- psam_h26_hu %>%
+  group_by(PUMA) %>%
+  summarise(
+    n_households       = n(),
+    pct_married        = round(mean(married_couple_hh, na.rm = TRUE) * 100, 2),
+    avg_65plus         = round(mean(n_65plus, na.rm = TRUE), 2),
+    pct_income_imputed = round(mean(hhincome_imputed, na.rm = TRUE) * 100, 2),
+    pct_lep            = round(mean(lep_household, na.rm = TRUE) * 100, 2),
+    .groups = "drop"
+  )
+tab_pums_summary <- puma_pums_summary %>%
+  kable(col.names = c("PUMA", "N Households", "% Married",
+                      "Avg. 65+", "% Income Imputed", "% LEP"),
+        caption = "PUMA-Level Summary: PUMS-Derived Household Indicators",
+        format.args = list(big.mark = ",")) %>%
+  kable_styling(font_size = 9, latex_options = c("scale_down", "hold_position"))
+tab_pums_summary
+```
+
+## 3. PUMA-County Structure
+```{r}
+library(readxl)
+
+# Joy's county-PUMA relationship classification
+mapping <- as.data.frame(read_xlsx("C:/Users/felbasa/Downloads/NCSES MSG/mi_puma_county_indicator.xlsx"))
+
+county_puma_counts <- mapping %>%
+  group_by(county_fips) %>%
+  summarise(n_pumas = n_distinct(puma_code), .groups = "drop")
+
+puma_county_counts <- mapping %>%
+  group_by(puma_code) %>%
+  summarise(n_counties = n_distinct(county_fips), .groups = "drop")
+
+county_relationship <- mapping %>%
+  left_join(county_puma_counts, by = "county_fips") %>%
+  left_join(puma_county_counts, by = "puma_code") %>%
+  group_by(county_fips) %>%
+  summarise(
+    n_pumas        = first(n_pumas),
+    max_n_counties = max(n_counties),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    relationship = case_when(
+      n_pumas == 1 & max_n_counties == 1 ~ "1:1",
+      n_pumas  > 1 & max_n_counties == 1 ~ "1:n",
+      n_pumas == 1 & max_n_counties  > 1 ~ "n:1",
+      n_pumas  > 1 & max_n_counties  > 1 ~ "n:m"
+    ),
+    fips = as.integer(county_fips)
+  )
+
+# --- Step 1: PUMA-level MSG + ACS comparison (eligible counties only) ---
+# NOTE: kept UNROUNDED here on purpose — rounding happens once, at display time (Step 4)
+
+puma_bg_raw <- msg_census_data %>%
+  distinct(fips_bg, .keep_all = TRUE) %>%
+  left_join(county_relationship %>% select(fips, relationship), by = "fips") %>%
+  filter(relationship %in% c("1:1", "n:1"))
+
+puma_msg_counts <- msg_census_data %>%
+  left_join(county_relationship %>% select(fips, relationship), by = "fips") %>%
+  filter(relationship %in% c("1:1", "n:1")) %>%
+  group_by(pumaid) %>%
+  summarise(
+    msg_hh_count = n_distinct(msgid),
+    msg_occupied = n_distinct(msgid[vacantcode == "N"]),
+    .groups = "drop"
+  )
+
+puma_acs_chars <- puma_bg_raw %>%
+  group_by(pumaid) %>%
+  summarise(
+    acs_occ_total = sum(occ_occupied_bgE, na.rm = TRUE),
+    acs_hu_total  = sum(hu_total_bgE,     na.rm = TRUE),
+    pov_rate      = sum(pov_below_bgE,     na.rm = TRUE) / sum(pov_total_bgE,    na.rm = TRUE),
+    pct_hispanic  = sum(race_hispanic_bgE, na.rm = TRUE) / sum(race_total_bgE,   na.rm = TRUE),
+    pct_rented    = sum(tenure_rented_bgE, na.rm = TRUE) / sum(tenure_total_bgE, na.rm = TRUE),
+    median_inc    = weighted.mean(median_hhincome_bgE, hu_total_bgE, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+puma_comparison_table <- puma_msg_counts %>%
+  left_join(puma_acs_chars, by = "pumaid") %>%
+  mutate(
+    msg_vs_acs_occ_ratio = msg_occupied / acs_occ_total,
+    pumaid = as.character(pumaid)   # fix type for downstream joins
+  )
+
+# --- Step 2: within-PUMA poverty variance significance test ---
+
+puma_county_map <- msg_census_data %>%
+  distinct(pumaid, fips) %>%
+  arrange(pumaid, fips) %>%
+  left_join(county_relationship %>% select(fips, relationship), by = "fips") %>%
+  filter(relationship %in% c("1:1", "n:1"))
+
+puma_pov_vals <- puma_county_map %>%
+  left_join(county_coverage_chars %>% select(fips, pov_rate), by = "fips") %>%
+  group_by(pumaid) %>%
+  summarise(pov_vals = list(pov_rate), .groups = "drop")
+
+var_chisq_pval <- function(data) {
+  if (length(data) < 2 || all(is.na(data))) return(NA_real_)
+  data    <- data[!is.na(data)]
+  df      <- length(data) - 1
+  v       <- var(data)
+  sigma0  <- 1e-6
+  testchi <- df * v / (sigma0^2)
+  pchisq(testchi, df = df, lower.tail = FALSE)
+}
+
+puma_sd_flag <- puma_pov_vals %>%
+  mutate(
+    sd_pov = sapply(pov_vals, function(x) sd(x, na.rm = TRUE)),
+    pval   = sapply(pov_vals, var_chisq_pval),
+    pumaid = as.character(pumaid)   # fix type for join
+  ) %>%
+  select(pumaid, sd_pov, pval)
+
+puma_comparison_table <- puma_comparison_table %>%
+  left_join(puma_sd_flag, by = "pumaid")
+
+# --- Step 3: PUMS-derived indicators ---
+# puma_pums_summary must already exist (built earlier from psam_h26_hu)
+
+puma_pums_summary <- puma_pums_summary %>%
+  mutate(pumaid = paste0("26", PUMA))
+
+puma_master_table <- puma_comparison_table %>%
+  left_join(
+    puma_pums_summary %>% select(pumaid, n_households, pct_married, avg_65plus,
+                                  pct_income_imputed, pct_lep),
+    by = "pumaid"
+  )
+
+# --- Step 4: round ONCE, format for display ---
+
+puma_master_display <- puma_master_table %>%
+  mutate(
+    pov_rate              = round(pov_rate, 3),
+    pct_hispanic          = round(pct_hispanic, 3),
+    pct_rented            = round(pct_rented, 3),
+    msg_vs_acs_occ_ratio  = round(msg_vs_acs_occ_ratio, 2),
+    sd_label = case_when(
+      is.na(sd_pov)              ~ "—",
+      !is.na(pval) & pval < 0.05 ~ paste0(round(sd_pov, 3), " *"),
+      TRUE                       ~ as.character(round(sd_pov, 3))
+    )
+  ) %>%
+  select(pumaid, msg_hh_count, msg_occupied, acs_occ_total, acs_hu_total,
+         msg_vs_acs_occ_ratio, pov_rate, sd_label, pct_hispanic, pct_rented,
+         median_inc, pct_married, avg_65plus, pct_income_imputed, pct_lep)
+
+tab_puma_master <- puma_master_display %>%
+  kable(col.names = c("PUMA ID", "MSG Total", "MSG Occupied",
+                      "ACS Occ", "ACS Total", "MSG/ACS Occ Ratio",
+                      "Poverty Rate", "SD Pov. Rate", "% Hispanic", "% Rented",
+                      "Median Income", "% Married", "Avg. 65+", "% Income Imputed", "% LEP"),
+        caption = "PUMA-Level Summary: MSG Coverage, ACS Characteristics, and PUMS Indicators.
+                   * SD significantly greater than zero (chi-square, p < 0.05).
+                   Only 1:1 and n:1 counties included to avoid double counting.",
+        format.args = list(big.mark = ",")) %>%
+  kable_styling(font_size = 8, latex_options = c("scale_down", "hold_position"))
+
+tab_puma_master
+```
